@@ -1,2 +1,14 @@
+# LLVM source and build output
 llvm-project/
 build/
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
