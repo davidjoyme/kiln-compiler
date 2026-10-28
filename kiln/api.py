@@ -25,6 +25,10 @@ class Options:
     print_ir: bool = False       # print the Kiln IR after every pass
     dump_mlir: bool = False      # print MLIR (and transform scripts) during lowering
     profile: bool = False        # emit per-kernel entry points for CompiledModule.profile()
+    device: str = "cpu"          # "cpu" (MLIR -> LLVM) or "cuda" (generated Triton kernels)
+    allow_tf32: bool = False     # GPU: TF32 tensor cores for fp32 matmuls (faster, ~1e-3 rel. error)
+    cuda_graphs: bool = True     # GPU: replay the whole launch sequence as one CUDA graph
+    gpu_matmul_config: object = None  # advanced: fn(graph, kernel) -> Triton matmul config
 
     @classmethod
     def none(cls, **kw):
@@ -50,16 +54,24 @@ class Report:
             lines.append(f"  {k}")
         low = self.lowering
         lines.append(f"  arena: {self.arena_bytes} bytes (no reuse: {self.naive_bytes}, "
-                     f"lower bound: {self.lower_bound_bytes}), "
-                     f"heap allocations per call: {low.get('heap_allocs', 0)}, "
-                     f"transformed kernels: {len(low.get('transformed', []))}, "
-                     f"fallbacks: {len(low.get('fallback', []))}")
+                     f"lower bound: {self.lower_bound_bytes})")
+        if low.get("backend") == "triton":
+            lines.append(f"  GPU: {low['launches']} Triton kernel launches, CUDA graphs: {low['cuda_graphs']}, "
+                         f"TF32: {low['tf32']}, source: {low['source']}")
+        else:
+            lines.append(f"  heap allocations per call: {low.get('heap_allocs', 0)}, "
+                         f"transformed kernels: {len(low.get('transformed', []))}, "
+                         f"fallbacks: {len(low.get('fallback', []))}")
         for name, stats in self.passes.items():
             lines.append(f"  {name}: {stats}")
         for e in self.autotune:
             b, m, n, k = e["shape"]
-            lines.append(f"  autotune {b}x{m}x{n}x{k} ({e['source']}): {e['model_gflops']} -> "
-                         f"{e['gflops']} GFLOP/s, tiles {e['tiles']}")
+            if "config" in e:   # GPU
+                lines.append(f"  autotune {b}x{m}x{n}x{k} ({e['source']}): {e['default_tflops']} -> "
+                             f"{e['tflops']} TFLOP/s, config {e['config']}")
+            else:
+                lines.append(f"  autotune {b}x{m}x{n}x{k} ({e['source']}): {e['model_gflops']} -> "
+                             f"{e['gflops']} GFLOP/s, tiles {e['tiles']}")
         return "\n".join(lines)
 
 
@@ -91,6 +103,10 @@ def compile_graph(graph: Graph, options: Options | None = None):
     from kiln.runtime.executor import Executable
 
     options = options or Options()
+    if options.device not in ("cpu", "cuda"):
+        raise ValueError(f"device must be 'cpu' or 'cuda', got {options.device!r}")
+    if options.device == "cuda":
+        return _compile_graph_gpu(graph, options)
     start = time.perf_counter()
     tuner = None
     if options.autotune and options.tiling and options.matmul_tiles_for is None:
@@ -113,6 +129,47 @@ def compile_graph(graph: Graph, options: Options | None = None):
                      kernel_names=[k.name for k in graph.kernels] if options.profile else ())
 
     report = Report(passes=pm.stats, timings=pm.timings, lowering=lowering)
+    report.kernels = [f"{k.name} {k.kind:<11} {' '.join(n.op for n in k.nodes)}" for k in graph.kernels]
+    report.arena_bytes = graph.attrs.get("arena_bytes", 0)
+    plan = pm.stats.get("memory-plan", {})
+    report.naive_bytes = plan.get("naive_bytes", 0)
+    report.lower_bound_bytes = plan.get("lower_bound_bytes", 0)
+    report.autotune = tuner.log if tuner is not None else []
+    report.compile_seconds = time.perf_counter() - start
+    return exe, report
+
+
+def _compile_graph_gpu(graph: Graph, options: Options):
+    """The GPU path: the same graph passes, then Triton code generation (kiln/gpu)."""
+    from dataclasses import replace
+
+    from kiln.gpu.codegen import generate
+    from kiln.gpu.runtime import GPUExecutable
+    from kiln.passes.manager import PassManager
+
+    start = time.perf_counter()
+    # Scheduling (tiling + vectorisation) is the CPU backend's; Triton tiles itself.
+    pm = PassManager(build_passes(replace(options, tiling=False)), print_after_all=options.print_ir)
+    pm.run(graph)
+    tuner = None
+    config_for = options.gpu_matmul_config
+    if config_for is None and options.autotune:
+        from kiln.gpu.autotune import GPUAutotuner
+
+        tuner = GPUAutotuner(allow_tf32=options.allow_tf32)
+        config_for = tuner.config_for
+    if config_for is None:
+        from kiln.gpu.codegen import default_matmul_config as config_for
+    program = generate(graph, allow_tf32=options.allow_tf32, matmul_config=config_for)
+    exe = GPUExecutable(program, graph.attrs.get("arena_bytes", 0), graph.constants,
+                        [a.shape for a in graph.args], [r.shape for r in graph.results],
+                        cuda_graphs=options.cuda_graphs)
+    if options.dump_mlir:
+        print(f"// ----- generated Triton ({exe.source_path}) -----\n{program.source}")
+
+    report = Report(passes=pm.stats, timings=pm.timings)
+    report.lowering = {"backend": "triton", "launches": len(program.launches), "source": str(exe.source_path),
+                       "cuda_graphs": exe.use_cuda_graphs, "tf32": options.allow_tf32}
     report.kernels = [f"{k.name} {k.kind:<11} {' '.join(n.op for n in k.nodes)}" for k in graph.kernels]
     report.arena_bytes = graph.attrs.get("arena_bytes", 0)
     plan = pm.stats.get("memory-plan", {})
@@ -182,8 +239,11 @@ def compile(model, example_inputs, options: Options | None = None, **flags) -> C
         y = compiled(x)
         print(compiled.report)
 
-    Keyword flags (freeze, fusion, memory_plan, tiling, target, autotune, print_ir,
-    dump_mlir, profile) override fields of
+    GPU: ``kiln.compile(model, inputs, device="cuda")`` generates Triton kernels;
+    call the result with CUDA tensors.
+
+    Keyword flags (freeze, fusion, memory_plan, tiling, target, autotune, device,
+    allow_tf32, cuda_graphs, print_ir, dump_mlir, profile) override fields of
     ``options``.
     """
     from kiln.frontend.fx_import import import_exported
@@ -208,4 +268,9 @@ def compile(model, example_inputs, options: Options | None = None, **flags) -> C
     live = dict(module.named_parameters()) | dict(module.named_buffers())
     exe, report = compile_graph(graph, options)
     params = [(i, live[a["param"]].detach()) for i, a in enumerate(graph.arg_attrs) if "param" in a]
+    if options.device == "cuda":
+        # Unfrozen weights are runtime inputs: moved to the GPU once, here, not on
+        # every call. A model already on the GPU shares its weight memory (and so
+        # its in-place updates); a CPU model's weights are copied at compile time.
+        params = [(i, t.to(exe.device)) for i, t in params]
     return CompiledModule(exe, report, graph, params, single)
