@@ -1,0 +1,54 @@
+// File: tests/lit/fusion.kir
+// RUN: %kiln-opt %s --passes=fusion | FileCheck %s
+// RUN: %kiln-opt %s --passes=fusion,buffer-assign | FileCheck %s --check-prefix=BUF
+
+// Pre-LN MLP block: LayerNorm -> Linear -> GELU -> Linear -> residual add.
+// Fusion forms three kernels: the LayerNorm row kernel, and two matmul
+// kernels whose epilogues absorb the bias, GELU and residual add.
+
+graph @mlp(%arg0: f32[8, 32]) -> (f32[8, 32]) {
+  %0 = const {name = "ln.weight"} : f32[32]
+  %1 = const {name = "ln.bias"} : f32[32]
+  %2 = const {value = 0.03125} : f32[]
+  %3 = const {value = 1e-05} : f32[]
+  %4 = reduce_sum %arg0 {dims = [1]} : f32[8, 1]
+  %5 = mul %4, %2 : f32[8, 1]
+  %6 = sub %arg0, %5 : f32[8, 32]
+  %7 = mul %6, %6 : f32[8, 32]
+  %8 = reduce_sum %7 {dims = [1]} : f32[8, 1]
+  %9 = mul %8, %2 : f32[8, 1]
+  %10 = add %9, %3 : f32[8, 1]
+  %11 = rsqrt %10 : f32[8, 1]
+  %12 = mul %6, %11 : f32[8, 32]
+  %13 = mul %12, %0 : f32[8, 32]
+  %14 = add %13, %1 : f32[8, 32]
+  %15 = const {name = "fc.weight"} : f32[32, 128]
+  %16 = const {name = "fc.bias"} : f32[128]
+  %17 = matmul %14, %15 : f32[8, 128]
+  %18 = add %17, %16 : f32[8, 128]
+  %19 = gelu %18 {approximate = "tanh"} : f32[8, 128]
+  %20 = const {name = "proj.weight"} : f32[128, 32]
+  %21 = const {name = "proj.bias"} : f32[32]
+  %22 = matmul %19, %20 : f32[8, 32]
+  %23 = add %22, %21 : f32[8, 32]
+  %24 = add %arg0, %23 : f32[8, 32]
+  return %24
+}
+
+// CHECK-LABEL: graph @mlp
+// CHECK-NEXT:  kernel @k0 reduction
+// CHECK-NEXT:  kernel @k1 matmul
+// CHECK-NEXT:  kernel @k2 matmul
+// CHECK-NOT:   kernel @
+// CHECK:       reduce_sum %arg0 {dims = [1], kernel = "k0"}
+// CHECK:       rsqrt %{{[0-9]+}} {kernel = "k0"}
+// CHECK:       add %{{[0-9]+}}, %1 {kernel = "k0"}
+// CHECK:       matmul %{{[0-9]+}}, %{{[0-9]+}} {kernel = "k1"}
+// CHECK:       gelu %{{[0-9]+}} {approximate = "tanh", kernel = "k1"}
+// CHECK:       matmul %{{[0-9]+}}, %{{[0-9]+}} {kernel = "k2"}
+// CHECK:       add %arg0, %{{[0-9]+}} {kernel = "k2"}
+
+// Only the three kernel results are materialised; every other value stays
+// inside its kernel.
+// BUF-COUNT-3: buffer =
+// BUF-NOT:     buffer =

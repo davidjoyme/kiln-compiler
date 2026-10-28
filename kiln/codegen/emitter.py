@@ -70,6 +70,7 @@ class OpInfo:
     extents: list
     operands: list = field(default_factory=list)   # ids of ops producing its inputs
     dests: list = field(default_factory=list)      # ids of ops producing its destinations (outs)
+    output: bool = False                           # writes a kernel output (a function argument)
 
 
 @dataclass
@@ -96,6 +97,7 @@ class _KernelEmitter:
         self.env = {}            # Value -> tensor SSA name
         self.producer = {}       # tensor SSA name -> op id
         self.op_counter = 0
+        self.out_values = set()  # Values written to the kernel's output arguments
 
     def fresh(self, prefix="v"):
         self.counter += 1
@@ -181,7 +183,8 @@ class _KernelEmitter:
         self.emit(f"}} -> {'(' + types + ')' if multi else types}")
         operands = [self.producer[self.env[v]] for v in inputs if self.env[v] in self.producer]
         dests = [self.producer[i] for i, _ in outs if i in self.producer]
-        self.ops.append(OpInfo(op_id, kind, roles, extents, operands, dests))
+        self.ops.append(OpInfo(op_id, kind, roles, extents, operands, dests,
+                               output=any(v in self.out_values for _, v in outs)))
         names = [f"{result}#{i}" for i in range(len(outs))] if multi else [result]
         for name, (_, v) in zip(names, outs):
             self.env[v] = name
@@ -359,6 +362,7 @@ class _KernelEmitter:
             t, _, _ = layout_memref_type(self.layouts[v])
             args.append((f"%out{i}", t))
             out_args[v] = (f"%out{i}", t)
+            self.out_values.add(v)
 
         members = set(self.k.nodes)
         users = self.g.users()

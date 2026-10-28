@@ -16,6 +16,7 @@ class Options:
     """Which optimisations to run. Every flag can be turned off for ablations."""
 
     freeze: bool = True          # parameters -> constants, then constant folding
+    fusion: bool = True          # multi-op kernels (otherwise one op per kernel)
     print_ir: bool = False       # print the Kiln IR after every pass
     dump_mlir: bool = False      # print MLIR (and transform scripts) during lowering
     profile: bool = False        # emit per-kernel entry points for CompiledModule.profile()
@@ -23,7 +24,7 @@ class Options:
     @classmethod
     def none(cls, **kw):
         """Every optimisation off: the baseline for ablations."""
-        return cls(freeze=False, **kw)
+        return cls(freeze=False, fusion=False, **kw)
 
 
 @dataclass
@@ -39,8 +40,11 @@ class Report:
         lines = [f"Kiln: {len(self.kernels)} kernels, compiled in {self.compile_seconds:.2f}s"]
         for k in self.kernels:
             lines.append(f"  {k}")
+        low = self.lowering
         lines.append(f"  arena: {self.arena_bytes} bytes, "
-                     f"heap allocations per call: {self.lowering.get('heap_allocs', 0)}")
+                     f"heap allocations per call: {low.get('heap_allocs', 0)}, "
+                     f"loop-fused kernels: {len(low.get('loop_fused', []))}, "
+                     f"fallbacks: {len(low.get('fallback', []))}")
         for name, stats in self.passes.items():
             lines.append(f"  {name}: {stats}")
         return "\n".join(lines)
@@ -49,13 +53,15 @@ class Report:
 def build_passes(options: Options):
     from kiln.passes.buffers import BufferAssignment, MemoryPlan
     from kiln.passes.freeze import ConstantFold, FreezeParameters
+    from kiln.passes.fusion import Fusion
     from kiln.passes.partition import OneOpPerKernel
     from kiln.passes.simplify import CSE, DCE, Canonicalize
 
     passes = [Canonicalize(), CSE()]
     if options.freeze:
         passes += [FreezeParameters(), ConstantFold(), Canonicalize(), CSE()]
-    passes += [DCE(), OneOpPerKernel(), BufferAssignment(), MemoryPlan()]
+    passes += [DCE(), Fusion() if options.fusion else OneOpPerKernel(),
+               BufferAssignment(), MemoryPlan()]
     return passes
 
 
@@ -77,7 +83,8 @@ def compile_graph(graph: Graph, options: Options | None = None):
     code = emit_module(graph, profile=options.profile)
     if options.dump_mlir:
         dump("MLIR from Kiln IR", code.text)
-    module, ctx, lowering = lower(code, dump if options.dump_mlir else None)
+    module, ctx, lowering = lower(code, dump if options.dump_mlir else None,
+                                  loop_fusion=options.fusion)
     exe = Executable(module, ctx, code.arg_spec, [a.shape for a in graph.args],
                      [r.shape for r in graph.results], graph.constants, entry=graph.name,
                      kernel_names=[k.name for k in graph.kernels] if options.profile else ())
@@ -148,7 +155,7 @@ def compile(model, example_inputs, options: Options | None = None, **flags) -> C
         y = compiled(x)
         print(compiled.report)
 
-    Keyword flags (freeze, print_ir, dump_mlir, profile) override fields of
+    Keyword flags (freeze, fusion, print_ir, dump_mlir, profile) override fields of
     ``options``.
     """
     from kiln.frontend.fx_import import import_exported
