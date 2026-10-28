@@ -1,13 +1,11 @@
 # File: kiln/codegen/lowering.py
-"""Apply loop fusion to each kernel, then lower the module to the LLVM dialect.
+"""Apply each kernel's transform script, then lower the module to the LLVM dialect.
 
-Each kernel's transform script (kiln/codegen/transforms.py) is applied on its
-own. If MLIR rejects one, that kernel is restored from a snapshot and compiled
-without loop fusion, with a warning: a fusion bug costs performance, never
-correctness or a failed compile.
-
-Kernels are still compiled to plain scalar loops (convert-linalg-to-loops);
-tiling for cache and vectorisation come in a later stage.
+Each kernel's script (kiln/codegen/transforms.py: loop fusion, and with a
+schedule also tiling and vectorisation) is applied on its own. If MLIR
+rejects one, that kernel is restored from a snapshot and compiled without
+it, as plain loops, with a warning: a scheduling bug costs performance,
+never correctness or a failed compile.
 """
 
 from __future__ import annotations
@@ -35,10 +33,12 @@ BUFFERIZE = [
 ]
 
 TO_LLVM = [
-    "convert-linalg-to-loops",
+    "convert-linalg-to-loops",       # anything left unscheduled: scalar loops
+    "convert-vector-to-scf",         # vector transfers that need loops (e.g. strided)
     "expand-strided-metadata",
     "lower-affine",
     "convert-scf-to-cf",
+    "convert-vector-to-llvm",        # vector ops -> LLVM vector IR (AVX / NEON registers)
     "finalize-memref-to-llvm",
     "convert-math-to-llvm",
     "convert-arith-to-llvm",
@@ -71,23 +71,23 @@ def apply_script(module: Module, script: str):
         del module.operation.attributes["transform.with_named_sequence"]
 
 
-def apply_loop_fusion(code: ModuleCode, ctx: Context, report: dict, dump=None) -> Module:
+def apply_scripts(code: ModuleCode, ctx: Context, report: dict, dump=None) -> Module:
     module = Module.parse(code.text, context=ctx)
     for kc in code.kernels:
         script = build_script(kc)
         if script is None:
             continue
         if dump is not None:
-            dump(f"loop-fusion script for {kc.kernel.name}", script)
+            dump(f"transform script for {kc.kernel.name}", script)
         snapshot = str(module)
         try:
             apply_script(module, script)
-            report["loop_fused"].append(kc.kernel.name)
+            report["transformed"].append(kc.kernel.name)
         except MLIRError as err:
             module = Module.parse(snapshot, context=ctx)
             first = str(err).splitlines()[0] if str(err) else "transform failed"
-            warnings.warn(f"Kiln: loop fusion for {kc.kernel.name} failed ({first}); "
-                          f"compiling it unfused")
+            warnings.warn(f"Kiln: transform script for {kc.kernel.name} failed ({first}); "
+                          f"compiling it as plain loops")
             report["fallback"].append(kc.kernel.name)
     return module
 
@@ -117,22 +117,25 @@ def copies_to_loops(module: Module) -> int:
     return len(copies)
 
 
-def lower(code: ModuleCode, dump=None, loop_fusion=True):
+def lower(code: ModuleCode, dump=None, transform=True):
     """Returns (llvm-dialect module, context, report)."""
     ctx = Context()
-    report = {"loop_fused": [], "fallback": []}
-    if loop_fusion:
-        module = apply_loop_fusion(code, ctx, report, dump)
+    report = {"transformed": [], "fallback": []}
+    if transform:
+        module = apply_scripts(code, ctx, report, dump)
     else:
         module = Module.parse(code.text, context=ctx)
     run_pipeline(module, ["canonicalize", "cse"])
     if dump is not None:
-        dump("after loop fusion", str(module))
+        dump("after transform scripts", str(module))
     run_pipeline(module, BUFFERIZE)
     report["copies_to_loops"] = copies_to_loops(module)
     text = str(module)
     report["heap_allocs"] = text.count("memref.alloc(") + text.count("memref.alloc()")
     report["stack_allocs"] = text.count("memref.alloca(")
+    # Vector ops in the kernels after bufferization (0 when nothing vectorised).
+    report["vector_ops"] = sum(text.count(f"vector.{op} ") for op in
+                               ("fma", "transfer_read", "transfer_write", "reduction"))
     if dump is not None:
         dump("after bufferization", text)
     run_pipeline(module, TO_LLVM)

@@ -28,11 +28,36 @@ MLIR's transform interpreter does the rewriting:
 
 Kernels with a single op (or a single matmul with no epilogue) have no
 intermediates and are left alone.
+
+Tiling and vectorisation
+------------------------
+
+When the schedule pass (kiln/passes/schedule.py) has annotated a kernel,
+the script also tiles for the cache and registers and vectorises:
+
+  tiled      (matmul kernels) tile the root into mc x nc cache tiles and fuse
+             the matmul and its producers in, so the epilogue reads a tile
+             that's still in cache; split k by kc; tile the matmul into
+             mr x nr x 1 register tiles; vectorise, which turns each register
+             tile's k step into mr broadcasts and mr * nr/VL vector FMAs
+             (outer-product form); hoist the accumulator out of the k loop
+             so it lives in registers.
+  rows       (LayerNorm, softmax) loop fusion over rows as above, then split
+             each row-wide op into vector-width chunks. Reductions use a
+             vector of partial accumulators and one horizontal reduction at
+             the end (tile_reduction_using_for).
+  vectorize  (elementwise and copy kernels) tile to vector-width chunks of
+             the innermost dimension and vectorise.
+
+Every op ends up as a loop nest over vectors of at most ``vector`` lanes.
+Vectorising a whole tensor at once (one 98304-element vector) is legal but
+makes LLVM's instruction selection take seconds and spill everywhere.
 """
 
 from __future__ import annotations
 
 from kiln.codegen.emitter import KernelCode
+from kiln.passes.schedule import largest_divisor
 
 ANY = "!transform.any_op"
 
@@ -71,6 +96,18 @@ class _Script:
         self.emit(f"{fused}, {new_containing} = transform.structured.fuse_into_containing_op "
                   f"{producer} into {containing} : ({ANY}, {ANY}) -> ({ANY}, {ANY})")
         return fused, new_containing
+
+    def tile_reduction(self, h, sizes):
+        names = [self.fresh() for _ in range(4)]
+        self.emit(f"{', '.join(names)} = transform.structured.tile_reduction_using_for {h} "
+                  f"by tile_sizes = [{', '.join(map(str, sizes))}] : ({ANY}) -> ({', '.join([ANY] * 4)})")
+        return names
+
+    def patterns(self, target, names):
+        self.emit(f"transform.apply_patterns to {target} {{")
+        for name in names:
+            self.emit(f"  transform.apply_patterns.{name}")
+        self.emit(f"}} : {ANY}")
 
     def func(self, name):
         h = self.fresh()
@@ -144,8 +181,8 @@ def row_tile_sizes(op):
     return sizes
 
 
-def build_script(code: KernelCode) -> str | None:
-    """Loop-fusion script for one kernel, or None if there's nothing to fuse."""
+def loop_fusion_script(code: KernelCode) -> str | None:
+    """Loop fusion only (no tiling/vectorisation), or None if there's nothing to fuse."""
     if code.kernel.kind == "copy" or code.root is None:
         return None
     root = next(op for op in code.ops if op.id == code.root)
@@ -167,3 +204,154 @@ def build_script(code: KernelCode) -> str | None:
     s.emit("  transform.apply_patterns.canonicalization")
     s.emit(f"}} : {ANY}")
     return s.text()
+
+
+# ---------------------------------------------------------------------------
+# Scheduled kernels: tiling + vectorisation
+# ---------------------------------------------------------------------------
+
+def _fuse_into_rows(s: _Script, code: KernelCode, root, sizes, plan):
+    """Tile ``root`` with ``sizes`` and fuse ``plan`` into the innermost loop."""
+    tiled, loops = s.tile(s.match_id(root.id), sizes)
+    handles = {root.id: tiled}
+    containing = loops[-1]
+    for op in reversed(plan):
+        handles[op.id], containing = s.fuse(s.match_id(op.id), containing)
+    s.patterns(s.func(code.kernel.name), ["tensor.fold_tensor_empty"])
+    return handles
+
+
+def _vector_chunks(s: _Script, code: KernelCode, handles, vw, only=None, tiled=None):
+    """Split ops into loops over vectors of at most ``vw`` lanes.
+
+    Outer dimensions are walked one at a time; the innermost dimension is cut
+    into the largest chunk <= vw that divides it. Ops already fused into a
+    tile loop (those in ``handles``) see the *tiled* extents: ``tiled`` maps a
+    loop role to its extent inside the tile (1 for each row of a row kernel,
+    mc / nc for a matmul's cache tile). Using the original extents there
+    would cut a size-1 dimension into 64-wide chunks, leaving dynamically
+    shaped tiles the vectoriser rejects.
+    """
+    tiled = tiled or {}
+    for op in code.ops:
+        if op.kind not in ("generic", "reduce", "fill") or not op.roles:
+            continue
+        if only is not None and op.id not in only:
+            continue
+        extents = [tiled.get(r, e) if op.id in handles else e for r, e in zip(op.roles, op.extents)]
+        outer = [1 if e > 1 else 0 for e in extents[:-1]]
+        inner = extents[-1]
+        chunk = largest_divisor(inner, vw)
+        chunk = chunk if chunk < inner else 0
+        h = handles.get(op.id) or s.match_id(op.id)
+        if op.kind == "reduce" and op.roles[-1] == "i":
+            # Rows with a plain loop, then the reduction with partial vector sums.
+            if any(outer):
+                h, _ = s.tile(h, outer + [0])
+            if chunk:
+                s.tile_reduction(h, [0] * len(outer) + [chunk])
+            continue
+        if any(outer) or chunk:
+            s.tile(h, outer + [chunk])
+
+
+def _rows(s: _Script, code: KernelCode, vw):
+    root = next(op for op in code.ops if op.id == code.root)
+    plan = fusion_plan(code)
+    sizes = row_tile_sizes(root)
+    if plan is None or not any(sizes) or root.kind not in ("generic", "reduce"):
+        _vector_chunks(s, code, {}, vw)
+        return
+    handles = _fuse_into_rows(s, code, root, sizes, plan)
+    in_row = {r: 1 for r, size in zip(root.roles, sizes) if size}
+    _vector_chunks(s, code, handles, vw, tiled=in_row)
+
+
+def _matmul(s: _Script, code: KernelCode, attrs, vw):
+    mm = next(op for op in code.ops if op.kind == "matmul")
+    root = next(op for op in code.ops if op.id == code.root)
+
+    # 1. Cache tiles of the root (b -> 1, m -> mc, n -> nc), matmul fused in.
+    cache = {"b": 1, "m": attrs["mc"], "n": attrs["nc"], "k": 0}
+    sizes = [cache[r] if cache[r] < e or r == "b" else 0 for r, e in zip(root.roles, root.extents)]
+    plan = fusion_plan(code)
+    handles = {}
+    if any(sizes) and plan is not None:
+        handles = _fuse_into_rows(s, code, root, sizes, plan)
+    in_tile = {r: size for r, size in zip(root.roles, sizes) if size}
+    mm_h = handles.get(mm.id) or s.match_id(mm.id)
+
+    # 2. Split k into kc slices, then mr x nr x 1 register tiles.
+    if "k" in mm.roles and attrs["kc"] < mm.extents[mm.roles.index("k")]:
+        mm_h, _ = s.tile(mm_h, [attrs["kc"] if r == "k" else 0 for r in mm.roles])
+    micro = {"b": 1, "m": attrs["mr"], "n": attrs["nr"], "k": 1}
+    s.tile(mm_h, [micro[r] for r in mm.roles])
+
+    # 3. Epilogue and the accumulator's zero-fill: vector chunks of a row.
+    others = {op.id for op in code.ops if op.id != mm.id and op.kind in ("generic", "fill")}
+    _vector_chunks(s, code, handles, vw, only=others, tiled=in_tile)
+
+
+VECTOR_LOWERING = [
+    'vector.lower_contraction lowering_strategy = "outerproduct"',
+    "vector.lower_outerproduct",
+    'vector.multi_reduction_flattening lowering_strategy = "innerreduction"',
+    'vector.multi_reduction_unrolling lowering_strategy = "innerreduction"',
+    "vector.transfer_permutation_patterns",
+    "tensor.fold_tensor_subset_ops_into_vector_transfers",
+    "linalg.tiling_canonicalization",
+    "scf.for_loop_canonicalization",
+    "canonicalization",
+]
+
+
+def scheduled_script(code: KernelCode) -> str | None:
+    attrs = code.kernel.attrs
+    strategy = attrs.get("strategy")
+    if strategy == "loops":
+        return loop_fusion_script(code)
+    vw = attrs.get("vector", 16)
+    s = _Script()
+    if strategy == "tiled":
+        _matmul(s, code, attrs, vw)
+    elif strategy == "rows":
+        _rows(s, code, vw)
+    elif strategy == "vectorize":
+        _vector_chunks(s, code, {}, vw)
+    else:
+        raise ValueError(f"unknown schedule strategy {strategy!r}")
+
+    # Vectorise the linalg ops (not tensor.insert_slice: vectorising those turns
+    # in-place tile updates into redundant copies after bufferization).
+    # linalg.reduce is the final combine tile_reduction_using_for creates for a
+    # split reduction: left scalar, it's a chain of 64 dependent max/add ops
+    # per row, which made vectorised softmax 2x slower than scalar loops.
+    # Vectorised, it becomes a horizontal reduction (a log2(64)-step shuffle tree).
+    func = s.func(code.kernel.name)
+    ops = s.fresh()
+    s.emit(f'{ops} = transform.structured.match ops{{["linalg.generic", "linalg.fill", "linalg.reduce"]}} '
+           f"in {func} : ({ANY}) -> {ANY}")
+    s.emit(f"transform.structured.vectorize {ops} : {ANY}")
+    # Recognise contractions again after vectorising (generic -> multi_reduction
+    # -> contract), then lower them to outer products: broadcast + FMA.
+    s.patterns(func, ["vector.reduction_to_contract", "vector.transfer_permutation_patterns",
+                      "canonicalization"])
+    s.patterns(func, VECTOR_LOWERING)
+    # Keep the accumulator in registers: hoist its transfer_read/transfer_write
+    # out of the k loop and carry it as a loop iteration argument.
+    loops = s.fresh()
+    s.emit(f'{loops} = transform.structured.match ops{{["scf.for"]}} in {func} : ({ANY}) -> {ANY}')
+    s.emit(f"transform.loop.hoist_loop_invariant_subsets {loops} : {ANY}")
+    s.patterns(func, ["canonicalization"])
+    return s.text()
+
+
+def build_script(code: KernelCode) -> str | None:
+    """The transform script for one kernel, or None to compile it as it is."""
+    if code.root is None:
+        return None
+    if "strategy" in code.kernel.attrs:
+        return scheduled_script(code)
+    if code.kernel.kind == "copy":
+        return None
+    return loop_fusion_script(code)

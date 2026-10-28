@@ -1,0 +1,49 @@
+// File: tests/lit/schedule.kir
+// RUN: %kiln-opt %s --passes=fusion,buffer-assign,memory-plan,schedule | FileCheck %s
+// RUN: %kiln-opt %s --passes=fusion,buffer-assign,memory-plan,schedule --emit=scripts | FileCheck %s --check-prefix=SCRIPT
+
+// LayerNorm (without the affine part) feeding the GPT-2 small MLP's first
+// Linear + GELU, scheduled for kiln-opt's fixed test target (AVX-512:
+// 16 lanes, 32 vector registers, 48 KiB L1, 2 MiB L2).
+
+graph @mlp_up(%arg0: f32[128, 768]) -> (f32[128, 3072]) {
+  %0 = const {value = 0.0013020833333333333} : f32[]
+  %1 = const {value = 1e-05} : f32[]
+  %2 = reduce_sum %arg0 {dims = [1]} : f32[128, 1]
+  %3 = mul %2, %0 : f32[128, 1]
+  %4 = sub %arg0, %3 : f32[128, 768]
+  %5 = mul %4, %4 : f32[128, 768]
+  %6 = reduce_sum %5 {dims = [1]} : f32[128, 1]
+  %7 = mul %6, %0 : f32[128, 1]
+  %8 = add %7, %1 : f32[128, 1]
+  %9 = rsqrt %8 : f32[128, 1]
+  %10 = mul %4, %9 : f32[128, 768]
+  %11 = const {name = "fc.weight"} : f32[768, 3072]
+  %12 = const {name = "fc.bias"} : f32[3072]
+  %13 = matmul %10, %11 : f32[128, 3072]
+  %14 = add %13, %12 : f32[128, 3072]
+  %15 = gelu %14 {approximate = "tanh"} : f32[128, 3072]
+  return %15
+}
+
+// The cost model's choices. Register tile 8 x 32 = 8 rows x 2 vectors:
+// 16 accumulators + 2 B vectors + 1 broadcast <= 32 registers.
+// kc = 128: (8 + 32) * 128 * 4 bytes = 20 KiB <= half the L1.
+// nc = 256 (the cap; the 128 x 256 B panel is 128 KiB, well within L2).
+// The 768-wide LayerNorm rows are split into 2-vector (32-float) chunks.
+// CHECK:      kernel @k0 reduction {strategy = "rows", vector = 32}
+// CHECK-NEXT: kernel @k1 matmul {strategy = "tiled", mc = 128, nc = 256, kc = 128, mr = 8, nr = 32, vector = 64}
+
+// The transform scripts that implement them.
+// SCRIPT-LABEL: @k0 (reduction): transform script
+// SCRIPT:       tile_using_for %{{.*}} tile_sizes [1, 0]
+// SCRIPT:       tile_reduction_using_for %{{.*}} by tile_sizes = [0, 32]
+// SCRIPT:       transform.structured.vectorize
+// SCRIPT-LABEL: @k1 (matmul): transform script
+// SCRIPT:       tile_using_for %{{.*}} tile_sizes [0, 256]
+// SCRIPT:       fuse_into_containing_op
+// SCRIPT:       tile_using_for %{{.*}} tile_sizes [0, 0, 128]
+// SCRIPT:       tile_using_for %{{.*}} tile_sizes [8, 32, 1]
+// SCRIPT:       transform.structured.vectorize
+// SCRIPT:       lower_contraction lowering_strategy = "outerproduct"
+// SCRIPT:       hoist_loop_invariant_subsets

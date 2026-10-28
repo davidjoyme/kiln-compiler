@@ -6,8 +6,9 @@ is memory traffic: how many times each element goes to and from memory.
 Unfused, every op in the chain writes its full result and the next op reads
 it back. Fused, each element is read once and written once.
 
-Shapes are GPT-2 small (d_model 768, 12 heads, 128 tokens). Kiln kernels
-are still scalar loops at this stage; vectorisation comes in a later stage.
+Shapes are GPT-2 small (d_model 768, 12 heads, 128 tokens). The unfused /
+fused comparison uses scalar loops (tiling off), so it measures fusion alone;
+the last Kiln column adds tiling + vectorisation (the default).
 
     python benchmarks/bench_fusion.py
 """
@@ -46,11 +47,11 @@ def main():
     ]
 
     print(f"{'workload':<26}{'kernels':>9}{'intermediate MB':>17}{'unfused ms':>12}"
-          f"{'fused ms':>10}{'speedup':>9}{'eager ms':>10}")
+          f"{'fused ms':>10}{'speedup':>9}{'+ vectorised ms':>17}{'eager ms':>10}")
     for name, fn, xs in workloads:
         results = {}
         for fusion in (False, True):
-            compiled = kiln.compile(fn, xs, fusion=fusion)
+            compiled = kiln.compile(fn, xs, fusion=fusion, tiling=False)
             with torch.no_grad():
                 torch.testing.assert_close(compiled(*xs), fn(*xs), rtol=1e-4, atol=1e-5)
             results[fusion] = (compiled, bench(compiled, *xs))
@@ -58,8 +59,11 @@ def main():
         kernels = f"{len(unfused.report.kernels)}->{len(fused.report.kernels)}"
         # Bytes materialised between kernels (before memory reuse): what fusion avoids writing.
         mb = f"{unfused.report.naive_bytes / 2**20:.2f}->{fused.report.naive_bytes / 2**20:.2f}"
+        vectorised = kiln.compile(fn, xs)
+        with torch.no_grad():
+            torch.testing.assert_close(vectorised(*xs), fn(*xs), rtol=1e-4, atol=1e-5)
         print(f"{name:<26}{kernels:>9}{mb:>17}{t_unfused:>12.3f}{t_fused:>10.3f}"
-              f"{t_unfused / t_fused:>8.2f}x{bench(fn, *xs):>10.3f}")
+              f"{t_unfused / t_fused:>8.2f}x{bench(vectorised, *xs):>17.3f}{bench(fn, *xs):>10.3f}")
 
 
 if __name__ == "__main__":

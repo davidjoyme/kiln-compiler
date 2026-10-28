@@ -1,6 +1,7 @@
-2.460586e+00 buffer_assign.kir
-2.485402e+00 canonicalize.kir
-2.462677e+00 const_fold.kir
-2.457474e+00 freeze.kir
-4.424174e+00 fusion.kir
-4.599511e+00 memory_plan.kir
+2.495978e+00 buffer_assign.kir
+2.411612e+00 canonicalize.kir
+2.958417e+00 const_fold.kir
+2.434893e+00 freeze.kir
+4.681399e+00 fusion.kir
+4.898355e+00 memory_plan.kir
+4.929419e+00 schedule.kir
