@@ -1,0 +1,37 @@
+// File: tests/lit/buffer_assign.kir
+// RUN: %kiln-opt %s --passes=partition,buffer-assign,memory-plan | FileCheck %s
+
+// Views become strided views of their source buffer (no copies). A copy is
+// inserted only when a view can't be expressed with strides, or when a
+// matmul's right-hand operand isn't contiguous along N.
+
+graph @attention_views(%arg0: f32[8, 48]) -> (f32[2, 8, 8], f32[8, 16]) {
+  %0 = relu %arg0 : f32[8, 48]
+  // split q / k, then heads: [8, 16] -> [8, 2, 8] -> [2, 8, 8]
+  %1 = slice %0 {dim = 1, start = 0, end = 16, step = 1} : f32[8, 16]
+  %2 = slice %0 {dim = 1, start = 16, end = 32, step = 1} : f32[8, 16]
+  %3 = reshape %1 {shape = [8, 2, 8]} : f32[8, 2, 8]
+  %4 = transpose %3 {perm = [1, 0, 2]} : f32[2, 8, 8]
+  %5 = reshape %2 {shape = [8, 2, 8]} : f32[8, 2, 8]
+  %6 = transpose %5 {perm = [1, 2, 0]} : f32[2, 8, 8]
+  %7 = matmul %4, %6 : f32[2, 8, 8]
+  // merging heads after a transpose is not a strided view: needs a copy
+  %8 = transpose %7 {perm = [1, 0, 2]} : f32[8, 2, 8]
+  %9 = reshape %8 {shape = [8, 16]} : f32[8, 16]
+  %10 = relu %9 : f32[8, 16]
+  return %7, %10
+}
+
+// CHECK-LABEL: graph @attention_views
+// CHECK-SAME:  attributes {arena_bytes = {{[0-9]+}}}
+// CHECK:       %[[X:[0-9]+]] = relu %arg0 {kernel = "k0", buffer = "arena", offset = 0}
+// CHECK:       slice %[[X]] {{.*}} strides = [48, 1], offset = 0}
+// CHECK:       slice %[[X]] {{.*}} strides = [48, 1], offset = 16}
+// CHECK:       transpose {{.*}} {perm = [1, 0, 2], strides = [8, 48, 1], offset = 0}
+// The right-hand side of q @ k^T has stride 48 along N: copied first.
+// CHECK:       %[[KT:[0-9]+]] = transpose {{.*}} {perm = [1, 2, 0], strides = [8, 1, 48], offset = 16}
+// CHECK:       %[[C:[0-9]+]] = copy %[[KT]] {kernel = "k{{[0-9]+}}", buffer = "arena"
+// CHECK:       %[[MM:[0-9]+]] = matmul %{{[0-9]+}}, %[[C]] {kernel = "k{{[0-9]+}}", buffer = "output"}
+// CHECK:       %[[T:[0-9]+]] = transpose %[[MM]] {perm = [1, 0, 2], strides = [8, 64, 1], offset = 0}
+// CHECK:       %[[C2:[0-9]+]] = copy %[[T]]
+// CHECK:       reshape %[[C2]] {shape = [8, 16], strides = [16, 1], offset = 0}

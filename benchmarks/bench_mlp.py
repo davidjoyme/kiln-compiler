@@ -1,75 +1,58 @@
-"""Correctness tests: every Kiln result must match eager PyTorch."""
+# File: benchmarks/bench_mlp.py
+"""Time an MLP in eager PyTorch vs Kiln, with and without freezing.
 
-import pytest
+Stage 1 compiles every kernel to plain scalar loops, so Kiln is much slower
+than eager here. That's expected: this is the baseline that fusion, memory
+planning and (above all) tiling + vectorisation will improve on.
+"""
+
+import argparse
+import time
+
 import torch
 
 import kiln
 
 
-@pytest.fixture(autouse=True)
-def fresh_compiler_state(monkeypatch):
-    # Fail loudly on unsupported ops instead of silently falling back.
-    monkeypatch.setenv("KILN_STRICT", "1")
-    torch._dynamo.reset()
-    kiln.stats.update(compiled=0, fallback=0)
+def bench(fn, x, warmup=3, iters=20):
+    with torch.no_grad():
+        for _ in range(warmup):
+            fn(x)
+        start = time.perf_counter()
+        for _ in range(iters):
+            fn(x)
+    return (time.perf_counter() - start) / iters * 1e3
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--batch", type=int, default=32)
+    p.add_argument("--hidden", type=int, default=256)
+    p.add_argument("--iters", type=int, default=20)
+    args = p.parse_args()
+
+    torch.set_num_threads(1)  # Kiln is single-threaded: compare like with like
     torch.manual_seed(0)
-    yield
-
-
-def compile_and_compare(fn, *inputs):
-    compiled = torch.compile(fn, backend=kiln.backend, dynamic=False)
-    with torch.no_grad():
-        expected = fn(*inputs)
-        actual = compiled(*inputs)
-    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
-    assert kiln.stats["compiled"] >= 1, "graph did not go through Kiln"
-
-
-@pytest.mark.parametrize("batch,d_in,d_hidden,d_out", [(2, 4, 8, 3), (16, 32, 64, 10), (1, 7, 5, 3)])
-def test_mlp(batch, d_in, d_hidden, d_out):
+    h = args.hidden
     model = torch.nn.Sequential(
-        torch.nn.Linear(d_in, d_hidden),
-        torch.nn.ReLU(),
-        torch.nn.Linear(d_hidden, d_out),
+        torch.nn.Linear(h, h), torch.nn.ReLU(),
+        torch.nn.Linear(h, h), torch.nn.ReLU(),
+        torch.nn.Linear(h, h),
     ).eval()
-    compile_and_compare(model, torch.randn(batch, d_in))
+    x = torch.randn(args.batch, h)
+    flops = 3 * 2 * args.batch * h * h
 
-
-def test_repeated_calls_reuse_compiled_code():
-    model = torch.nn.Linear(4, 4).eval()
-    compiled = torch.compile(model, backend=kiln.backend, dynamic=False)
-    with torch.no_grad():
-        for _ in range(3):
-            x = torch.randn(3, 4)
-            torch.testing.assert_close(compiled(x), model(x))
-    assert kiln.stats["compiled"] == 1
-
-
-def test_matmul_without_bias():
-    compile_and_compare(lambda a, b: a @ b, torch.randn(5, 6), torch.randn(6, 7))
-
-
-def test_broadcasting_elementwise():
-    def fn(x, row, col):
-        return (x + row) * col - x
-
-    compile_and_compare(fn, torch.randn(4, 5), torch.randn(5), torch.randn(4, 1))
-
-
-def test_scalar_operands():
-    compile_and_compare(lambda x: torch.relu(x * 2.0 + 1.0), torch.randn(3, 3))
-
-
-def test_multiple_outputs():
-    compile_and_compare(lambda x, y: (x + y, x * y), torch.randn(2, 3), torch.randn(2, 3))
-
-
-def test_unsupported_op_falls_back(monkeypatch):
-    monkeypatch.setenv("KILN_STRICT", "0")
-    fn = lambda x: torch.sigmoid(x)
-    compiled = torch.compile(fn, backend=kiln.backend, dynamic=False)
-    x = torch.randn(3)
-    with pytest.warns(UserWarning, match="falling back"):
+    print(f"MLP batch={args.batch} hidden={h} (1 thread)")
+    rows = [("eager", model)]
+    for freeze in (True, False):
+        compiled = kiln.compile(model, (x,), freeze=freeze)
         with torch.no_grad():
-            torch.testing.assert_close(compiled(x), fn(x))
-    assert kiln.stats["fallback"] == 1
+            torch.testing.assert_close(compiled(x), model(x), rtol=1e-4, atol=1e-4)
+        rows.append((f"kiln freeze={freeze}", compiled))
+    for name, fn in rows:
+        ms = bench(fn, x, iters=args.iters)
+        print(f"  {name:<20} {ms:9.3f} ms  {flops / ms / 1e6:7.2f} GFLOP/s")
+
+
+if __name__ == "__main__":
+    main()

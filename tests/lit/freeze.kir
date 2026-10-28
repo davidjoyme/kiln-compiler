@@ -1,0 +1,21 @@
+// File: tests/lit/freeze.kir
+// RUN: %kiln-opt %s --passes=freeze,const-fold,dce | FileCheck %s
+
+// A Linear layer as ATen lowers it: addmm(bias, x, weight.t()).
+// Freezing turns the parameters into constants; constant folding then
+// evaluates the transpose at compile time, leaving the weight stored in the
+// [in, out] layout the matmul wants.
+
+graph @linear(%arg0: f32[32, 16] {param = "fc.weight"}, %arg1: f32[32] {param = "fc.bias"}, %arg2: f32[4, 16]) -> (f32[4, 32]) {
+  %0 = transpose %arg0 {perm = [1, 0]} : f32[16, 32]
+  %1 = matmul %arg2, %0 : f32[4, 32]
+  %2 = add %1, %arg1 : f32[4, 32]
+  return %2
+}
+
+// CHECK-LABEL: graph @linear(%arg0: f32[4, 16]) -> (f32[4, 32])
+// CHECK-NOT:   transpose
+// CHECK-DAG:   %[[W:[0-9]+]] = const {name = "fc.weight.transpose"} : f32[16, 32]
+// CHECK-DAG:   %[[B:[0-9]+]] = const {name = "fc.bias"} : f32[32]
+// CHECK:       %[[MM:[0-9]+]] = matmul %arg0, %[[W]] : f32[4, 32]
+// CHECK:       add %[[MM]], %[[B]] : f32[4, 32]

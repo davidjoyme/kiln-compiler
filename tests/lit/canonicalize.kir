@@ -1,0 +1,27 @@
+// File: tests/lit/canonicalize.kir
+// RUN: %kiln-opt %s --passes=canonicalize,cse,dce | FileCheck %s
+
+graph @views(%arg0: f32[4, 6]) -> (f32[6, 4], f32[2, 12], f32[4, 6]) {
+  // transpose(transpose(x)) composes into one transpose
+  %0 = transpose %arg0 {perm = [1, 0]} : f32[6, 4]
+  %1 = transpose %0 {perm = [1, 0]} : f32[4, 6]
+  %2 = transpose %1 {perm = [1, 0]} : f32[6, 4]
+  // reshape(reshape(x)) becomes a single reshape
+  %3 = reshape %arg0 {shape = [24]} : f32[24]
+  %4 = reshape %3 {shape = [2, 12]} : f32[2, 12]
+  // x * 1 and identity views disappear; duplicate ops are merged
+  %5 = const {value = 1.0} : f32[]
+  %6 = mul %arg0, %5 : f32[4, 6]
+  %7 = expand %6 {shape = [4, 6]} : f32[4, 6]
+  %8 = relu %7 : f32[4, 6]
+  %9 = relu %arg0 : f32[4, 6]
+  %10 = add %8, %9 : f32[4, 6]
+  return %2, %4, %10
+}
+
+// CHECK-LABEL: graph @views
+// CHECK-NEXT:  %0 = transpose %arg0 {perm = [1, 0]} : f32[6, 4]
+// CHECK-NEXT:  %1 = reshape %arg0 {shape = [2, 12]} : f32[2, 12]
+// CHECK-NEXT:  %2 = relu %arg0 : f32[4, 6]
+// CHECK-NEXT:  %3 = add %2, %2 : f32[4, 6]
+// CHECK-NEXT:  return %0, %1, %3

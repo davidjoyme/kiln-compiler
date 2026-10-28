@@ -1,0 +1,4 @@
+2.424336e+00 buffer_assign.kir
+2.399219e+00 canonicalize.kir
+2.397888e+00 const_fold.kir
+2.404461e+00 freeze.kir

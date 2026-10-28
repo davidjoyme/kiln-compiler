@@ -1,9 +1,15 @@
+# File: examples/mlp.py
 """Compile a small MLP with Kiln and compare it against eager PyTorch.
 
-Run with KILN_DUMP_IR=1 to see the MLIR at every stage of the pipeline.
+    python examples/mlp.py              # result + compile report
+    python examples/mlp.py --ir         # also print the Kiln IR after every pass
+    python examples/mlp.py --mlir       # also print the generated MLIR
 """
 
+import sys
+
 import torch
+
 import kiln
 
 
@@ -16,18 +22,16 @@ def main():
     ).eval()
     x = torch.randn(2, 4)
 
-    # dynamic=False: Kiln only handles static shapes, so recompile per shape.
-    compiled = torch.compile(model, backend=kiln.backend, dynamic=False)
+    compiled = kiln.compile(model, (x,), print_ir="--ir" in sys.argv, dump_mlir="--mlir" in sys.argv)
 
-    # Kiln only handles inference graphs for now, so disable autograd.
     with torch.no_grad():
         expected = model(x)
-        actual = compiled(x)
+    actual = compiled(x)
 
     print("eager:\n", expected)
     print("kiln:\n", actual)
     print("match:", torch.allclose(expected, actual, atol=1e-5))
-    print("stats:", kiln.stats)
+    print(compiled.report)
 
 
 if __name__ == "__main__":
