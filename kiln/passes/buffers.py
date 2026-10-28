@@ -19,11 +19,8 @@ assignment inserts an explicit ``copy`` kernel to *realise* the value in a
 contiguous buffer. This is the one place where layout is decided, which keeps
 fusion and codegen free of layout logic.
 
-Each kernel output then needs an offset in the *arena*: one preallocated
-block of memory, allocated once at load time and reused on every call, so
-the compiled code performs no heap allocation. In this stage every buffer
-simply gets its own slot; the memory-planning stage replaces that with
-liveness-based reuse.
+Each kernel output then needs an offset in the *arena*, one block of memory
+allocated once at load time; kiln/passes/memory_plan.py assigns those.
 """
 
 from __future__ import annotations
@@ -267,25 +264,3 @@ def _order_kernels(graph: Graph):
         k.name = new_name
         k.nodes.sort(key=pos.get)
     graph.kernels = order
-
-
-def _align(n):
-    return (n + ALIGNMENT - 1) // ALIGNMENT * ALIGNMENT
-
-
-class MemoryPlan(Pass):
-    """Assign arena offsets: one aligned slot per buffer, no reuse (yet)."""
-
-    name = "memory-plan"
-
-    def run(self, graph: Graph):
-        layouts = compute_layouts(graph)
-        offset = 0
-        count = 0
-        for v, lay in layouts.items():
-            if lay.base[0] == "arena" and lay.base[1] is v:
-                v.node.attrs["offset"] = offset
-                offset += _align(v.type.nbytes)
-                count += 1
-        graph.attrs["arena_bytes"] = offset
-        return {"buffers": count, "arena_bytes": offset}

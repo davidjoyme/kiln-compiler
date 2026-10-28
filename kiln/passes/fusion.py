@@ -29,7 +29,13 @@ Legality. A node may join a producer's kernel only if:
   * joining does not create a cycle between kernels. If the node also
     depends on kernel H, and H (transitively) depends on the target kernel K,
     then putting the node in K would make K both a producer and a consumer of
-    H. This is the standard fusion legality check (XLA, TVM).
+    H. This is the standard fusion legality check (XLA, TVM);
+  * the node doesn't read the target kernel's own results through a view.
+    A view (say a transpose) of a value computed in kernel K, read by an
+    elementwise op in K, needs element [j, i] while computing [i, j]:
+    another iteration's result. The value must be complete, so in memory,
+    before the read: a cycle from K back to itself. (Found by the random
+    graph test in tests/test_memory_plan.py.)
 
 Matmul epilogues additionally require the matmul result to have no other
 users: otherwise the full matmul output would have to be materialised anyway,
@@ -140,6 +146,16 @@ class Fusion(Pass):
         groups: list[_Group] = []
         succ: dict[_Group, set] = {}
 
+        def view_producer_groups(n):
+            """Kernels whose results ``n`` reads through a view op."""
+            out = []
+            for v in n.inputs:
+                if v.node is not None and ops.kind(v.node.op) == "view":
+                    src = resolve_view(v).node
+                    if src is not None and src in group_of:
+                        out.append(group_of[src])
+            return out
+
         def producer_groups(n):
             out = []
             for v in n.inputs:
@@ -161,11 +177,14 @@ class Fusion(Pass):
                         direct.append(group_of[v.node])
                 direct.sort(key=lambda g: _PRIORITY[g.kind])
                 all_producers = producer_groups(n)
+                through_views = view_producer_groups(n)
                 for g in direct:
                     if not self._can_join(n, g, group_of, users):
                         continue
                     if any(h is not g and self._reaches(g, h, succ) for h in all_producers):
                         continue  # would create a cycle between kernels
+                    if g in through_views:
+                        continue  # would read its own results through a view
                     target = g
                     break
 

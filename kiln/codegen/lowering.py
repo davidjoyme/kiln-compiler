@@ -14,7 +14,8 @@ from __future__ import annotations
 
 import warnings
 
-from mlir.ir import Context, MLIRError, Module
+from mlir.dialects import linalg
+from mlir.ir import Context, InsertionPoint, Location, MLIRError, Module, WalkResult
 from mlir.passmanager import PassManager
 
 from kiln.codegen.emitter import ModuleCode
@@ -91,6 +92,31 @@ def apply_loop_fusion(code: ModuleCode, ctx: Context, report: dict, dump=None) -
     return module
 
 
+def copies_to_loops(module: Module) -> int:
+    """Rewrite every memref.copy left after bufferization into a linalg.copy.
+
+    Bufferization inserts memref.copy when a kernel's result is a copy of
+    one of its inputs, for example when canonicalization folds maximum(x, x)
+    to x. For a strided source, MLIR lowers memref.copy to a call into its
+    C runner-utils library (memrefCopy), which Kiln doesn't link. linalg.copy
+    lowers to plain loops like every other kernel. Returns the count.
+    """
+    copies = []
+
+    def visit(op):
+        if op.name == "memref.copy":
+            copies.append(op)
+        return WalkResult.ADVANCE
+
+    module.operation.walk(visit)
+    with module.context, Location.unknown():
+        for op in copies:
+            with InsertionPoint(op):
+                linalg.copy(op.operands[0], outs=[op.operands[1]])
+            op.erase()
+    return len(copies)
+
+
 def lower(code: ModuleCode, dump=None, loop_fusion=True):
     """Returns (llvm-dialect module, context, report)."""
     ctx = Context()
@@ -103,6 +129,7 @@ def lower(code: ModuleCode, dump=None, loop_fusion=True):
     if dump is not None:
         dump("after loop fusion", str(module))
     run_pipeline(module, BUFFERIZE)
+    report["copies_to_loops"] = copies_to_loops(module)
     text = str(module)
     report["heap_allocs"] = text.count("memref.alloc(") + text.count("memref.alloc()")
     report["stack_allocs"] = text.count("memref.alloca(")

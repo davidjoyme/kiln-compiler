@@ -17,6 +17,7 @@ class Options:
 
     freeze: bool = True          # parameters -> constants, then constant folding
     fusion: bool = True          # multi-op kernels (otherwise one op per kernel)
+    memory_plan: bool = True     # buffers share arena memory when lifetimes don't overlap
     print_ir: bool = False       # print the Kiln IR after every pass
     dump_mlir: bool = False      # print MLIR (and transform scripts) during lowering
     profile: bool = False        # emit per-kernel entry points for CompiledModule.profile()
@@ -24,7 +25,7 @@ class Options:
     @classmethod
     def none(cls, **kw):
         """Every optimisation off: the baseline for ablations."""
-        return cls(freeze=False, fusion=False, **kw)
+        return cls(freeze=False, fusion=False, memory_plan=False, **kw)
 
 
 @dataclass
@@ -34,6 +35,8 @@ class Report:
     lowering: dict = field(default_factory=dict)
     kernels: list = field(default_factory=list)
     arena_bytes: int = 0
+    naive_bytes: int = 0         # arena size without reuse (one slot per buffer)
+    lower_bound_bytes: int = 0   # peak live bytes: no plan can be smaller
     compile_seconds: float = 0.0
 
     def __str__(self):
@@ -41,7 +44,8 @@ class Report:
         for k in self.kernels:
             lines.append(f"  {k}")
         low = self.lowering
-        lines.append(f"  arena: {self.arena_bytes} bytes, "
+        lines.append(f"  arena: {self.arena_bytes} bytes (no reuse: {self.naive_bytes}, "
+                     f"lower bound: {self.lower_bound_bytes}), "
                      f"heap allocations per call: {low.get('heap_allocs', 0)}, "
                      f"loop-fused kernels: {len(low.get('loop_fused', []))}, "
                      f"fallbacks: {len(low.get('fallback', []))}")
@@ -51,7 +55,8 @@ class Report:
 
 
 def build_passes(options: Options):
-    from kiln.passes.buffers import BufferAssignment, MemoryPlan
+    from kiln.passes.buffers import BufferAssignment
+    from kiln.passes.memory_plan import MemoryPlan
     from kiln.passes.freeze import ConstantFold, FreezeParameters
     from kiln.passes.fusion import Fusion
     from kiln.passes.partition import OneOpPerKernel
@@ -61,7 +66,7 @@ def build_passes(options: Options):
     if options.freeze:
         passes += [FreezeParameters(), ConstantFold(), Canonicalize(), CSE()]
     passes += [DCE(), Fusion() if options.fusion else OneOpPerKernel(),
-               BufferAssignment(), MemoryPlan()]
+               BufferAssignment(), MemoryPlan(reuse=options.memory_plan)]
     return passes
 
 
@@ -92,6 +97,9 @@ def compile_graph(graph: Graph, options: Options | None = None):
     report = Report(passes=pm.stats, timings=pm.timings, lowering=lowering)
     report.kernels = [f"{k.name} {k.kind:<11} {' '.join(n.op for n in k.nodes)}" for k in graph.kernels]
     report.arena_bytes = graph.attrs.get("arena_bytes", 0)
+    plan = pm.stats.get("memory-plan", {})
+    report.naive_bytes = plan.get("naive_bytes", 0)
+    report.lower_bound_bytes = plan.get("lower_bound_bytes", 0)
     report.compile_seconds = time.perf_counter() - start
     return exe, report
 
@@ -155,7 +163,8 @@ def compile(model, example_inputs, options: Options | None = None, **flags) -> C
         y = compiled(x)
         print(compiled.report)
 
-    Keyword flags (freeze, fusion, print_ir, dump_mlir, profile) override fields of
+    Keyword flags (freeze, fusion, memory_plan, print_ir, dump_mlir, profile) override
+    fields of
     ``options``.
     """
     from kiln.frontend.fx_import import import_exported

@@ -11,4 +11,4 @@ __pycache__/
 # Editors / OS
 .vscode/
 .idea/
-.DS_Store
+.DS_Storetests/lit/Output/

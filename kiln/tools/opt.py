@@ -17,7 +17,8 @@ import sys
 
 
 def make_pass(name):
-    from kiln.passes.buffers import BufferAssignment, MemoryPlan
+    from kiln.passes.buffers import BufferAssignment
+    from kiln.passes.memory_plan import MemoryPlan
     from kiln.passes.freeze import ConstantFold, FreezeParameters
     from kiln.passes.fusion import Fusion
     from kiln.passes.partition import OneOpPerKernel
@@ -33,6 +34,7 @@ def make_pass(name):
         "fusion": Fusion,
         "buffer-assign": BufferAssignment,
         "memory-plan": MemoryPlan,
+        "memory-plan-naive": lambda: MemoryPlan(reuse=False),
     }
     if name not in table:
         raise SystemExit(f"kiln-opt: unknown pass '{name}' (known: {', '.join(table)})")

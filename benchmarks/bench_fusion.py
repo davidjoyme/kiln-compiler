@@ -56,7 +56,8 @@ def main():
             results[fusion] = (compiled, bench(compiled, *xs))
         (unfused, t_unfused), (fused, t_fused) = results[False], results[True]
         kernels = f"{len(unfused.report.kernels)}->{len(fused.report.kernels)}"
-        mb = f"{unfused.report.arena_bytes / 2**20:.2f}->{fused.report.arena_bytes / 2**20:.2f}"
+        # Bytes materialised between kernels (before memory reuse): what fusion avoids writing.
+        mb = f"{unfused.report.naive_bytes / 2**20:.2f}->{fused.report.naive_bytes / 2**20:.2f}"
         print(f"{name:<26}{kernels:>9}{mb:>17}{t_unfused:>12.3f}{t_fused:>10.3f}"
               f"{t_unfused / t_fused:>8.2f}x{bench(fn, *xs):>10.3f}")
 

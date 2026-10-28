@@ -4,6 +4,7 @@
 import pytest
 import torch
 import torch.nn.functional as F
+
 import kiln
 from models.transformer import Block
 
@@ -126,3 +127,12 @@ def test_backend_falls_back_on_unsupported_ops(monkeypatch):
         with torch.no_grad():
             torch.testing.assert_close(compiled(x), fn(x))
     assert kiln.stats["fallback"] == 1
+
+
+def test_kernel_that_folds_to_a_copy_of_a_strided_input():
+    # maximum(x, x) folds to x, so the kernel becomes "copy the input", and
+    # the input is a transposed (strided) view. Bufferization emits a
+    # memref.copy, which must lower to loops, not a runtime-library call.
+    fn = lambda x: torch.maximum(x.t(), x.t())
+    c = check(fn, torch.randn(4, 6))
+    assert c.report.lowering["copies_to_loops"] >= 1

@@ -1,0 +1,33 @@
+// File: tests/lit/memory_plan.kir
+// RUN: %kiln-opt %s --passes=partition,buffer-assign,memory-plan | FileCheck %s
+// RUN: %kiln-opt %s --passes=partition,buffer-assign,memory-plan-naive | FileCheck %s --check-prefix=NAIVE
+
+// Four 1 KiB intermediates. %0 is read again at the end through a transpose,
+// so it stays live the whole time; %1, %2 and %3 die young.
+//
+//   kernel:   k0   k1   k2   k3   k4
+//   %0        [=====================]   live in k0..k4 (read via %4 in k4)
+//   %1             [====]               k1..k2
+//   %2                  [====]          k2..k3
+//   %3                       [====]     k3..k4
+//
+// At most three are live at once, so a 3 KiB arena is optimal: %3 reuses
+// %1's slot, because %1 is dead by the time %3 is written.
+
+graph @lifetimes(%arg0: f32[16, 16]) -> (f32[16, 16]) {
+  %0 = exp %arg0 : f32[16, 16]
+  %1 = relu %0 : f32[16, 16]
+  %2 = neg %1 : f32[16, 16]
+  %3 = tanh %2 : f32[16, 16]
+  %4 = transpose %0 {perm = [1, 0]} : f32[16, 16]
+  %5 = add %3, %4 : f32[16, 16]
+  return %5
+}
+
+// CHECK-LABEL: graph @lifetimes{{.*}} attributes {arena_bytes = 3072}
+// CHECK:       %0 = exp %arg0 {kernel = "k0", buffer = "arena", offset = [[A:[0-9]+]]}
+// CHECK:       %1 = relu %0 {kernel = "k1", buffer = "arena", offset = [[B:[0-9]+]]}
+// CHECK:       %2 = neg %1 {kernel = "k2", buffer = "arena", offset = [[C:[0-9]+]]}
+// CHECK:       %3 = tanh %2 {kernel = "k3", buffer = "arena", offset = [[B]]}
+
+// NAIVE:       attributes {arena_bytes = 4096}

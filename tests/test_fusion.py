@@ -39,7 +39,8 @@ def test_transformer_block_kernels():
     assert "k9 matmul      matmul add gelu" in fused.report.kernels   # MLP: bias + GELU epilogue
     assert fused.report.lowering["heap_allocs"] == 0                   # row temporaries on the stack
     assert fused.report.lowering["fallback"] == []
-    assert fused.report.arena_bytes < unfused.report.arena_bytes / 2
+    # Fusion leaves fewer buffers to materialise (measured before memory reuse).
+    assert fused.report.naive_bytes < unfused.report.naive_bytes / 2
 
 
 def test_layernorm_is_one_kernel():
@@ -106,3 +107,27 @@ def test_views_end_kernels():
 def test_row_kernels_with_odd_shapes(shape):
     x = torch.randn(*shape)
     check_both_ways(lambda t: F.layer_norm(t, (shape[-1],)) + F.softmax(t, -1), x)
+
+
+def test_kernel_never_reads_its_own_result_through_a_view():
+    # Found by the random-graph test. %4 is computed in the same kernel as
+    # %1, but reads %1 transposed: element [i, j] needs %1[j, i], which a
+    # different iteration produces. %4 must start a new kernel.
+    src = """
+    graph @f(%arg0: f32[4, 4]) -> (f32[4, 4]) {
+      %0 = add %arg0, %arg0 : f32[4, 4]
+      %1 = tanh %0 : f32[4, 4]
+      %2 = transpose %1 {perm = [1, 0]} : f32[4, 4]
+      %3 = relu %0 : f32[4, 4]
+      %4 = sub %2, %3 : f32[4, 4]
+      return %4
+    }"""
+    kernels = kernels_of(src)
+    assert kernels == [("elementwise", ["add", "tanh", "relu"]), ("elementwise", ["sub"])]
+
+    g = parse(src)
+    x = torch.randn(4, 4)
+    exe, _ = kiln.compile_graph(g, kiln.Options())
+    (out,) = exe(x)
+    expected = torch.tanh(x + x).t() - torch.relu(x + x)
+    torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-6)
