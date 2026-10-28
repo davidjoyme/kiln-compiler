@@ -1,10 +1,12 @@
 # File: benchmarks/bench_matmul.py
-"""Matmul throughput (GFLOP/s) at GPT-2 small shapes: Kiln scalar vs tiled vs eager.
+"""Matmul throughput (GFLOP/s) at GPT-2 small shapes: Kiln scalar / tiled / autotuned vs eager.
 
 Each workload is an nn.Linear (matmul + bias epilogue) with 128 tokens, the
 four projections of a GPT-2 small block plus a single-token decode step.
 Everything runs on one thread: Kiln doesn't parallelise yet, so this
-compares code quality, not core count.
+compares code quality, not core count. "tiled" uses the cost model's tiles,
+"tuned" the autotuner's (the first run tunes each shape, ~10 s each; later
+runs read the cache).
 
     python benchmarks/bench_matmul.py            # scalar column only for small shapes
     python benchmarks/bench_matmul.py --all      # scalar for every shape (slow)
@@ -49,25 +51,25 @@ def main():
     torch.manual_seed(0)
     run_all = "--all" in sys.argv
     print(f"target: {host()}  (1 thread)")
-    print(f"{'workload':<18}{'M x N x K':>16}{'kiln scalar':>13}{'kiln tiled':>12}{'eager':>9}"
-          f"{'tiled/scalar':>14}{'tiled/eager':>13}   (GFLOP/s)")
+    print(f"{'workload':<18}{'M x N x K':>16}{'kiln scalar':>13}{'kiln tiled':>12}{'kiln tuned':>12}"
+          f"{'eager':>9}{'tuned/eager':>13}   (GFLOP/s)")
     for name, m, n, k in SHAPES:
         linear = torch.nn.Linear(k, n).eval()
         x = torch.randn(m, k)
         flops = 2 * m * n * k
         results = {}
-        for tiling in (False, True):
-            if not tiling and m * n * k > 128 * 768 * 768 and not run_all:
+        for config, flags in (("scalar", {"tiling": False}), ("tiled", {}), ("tuned", {"autotune": True})):
+            if config == "scalar" and m * n * k > 128 * 768 * 768 and not run_all:
                 continue
-            compiled = kiln.compile(linear, (x,), tiling=tiling)
+            compiled = kiln.compile(linear, (x,), **flags)
             with torch.no_grad():
                 torch.testing.assert_close(compiled(x), linear(x), rtol=1e-3, atol=1e-4)
-            results[tiling] = flops / seconds_per_call(compiled, x) / 1e9
+            results[config] = flops / seconds_per_call(compiled, x) / 1e9
         eager = flops / seconds_per_call(linear, x) / 1e9
-        scalar = results.get(False)
+        scalar = results.get("scalar")
         print(f"{name:<18}{f'{m}x{n}x{k}':>16}"
-              f"{(f'{scalar:.1f}' if scalar else '-'):>13}{results[True]:>12.1f}{eager:>9.1f}"
-              f"{(f'{results[True] / scalar:.0f}x' if scalar else '-'):>14}{results[True] / eager:>12.2f}x")
+              f"{(f'{scalar:.1f}' if scalar else '-'):>13}{results['tiled']:>12.1f}{results['tuned']:>12.1f}"
+              f"{eager:>9.1f}{results['tuned'] / eager:>12.2f}x", flush=True)
 
 
 if __name__ == "__main__":

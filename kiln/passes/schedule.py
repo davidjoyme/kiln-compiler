@@ -95,6 +95,21 @@ def largest_divisor(n, limit, multiple_of=1):
     return best
 
 
+def max_mr(nr, t: Target):
+    """Most rows a register tile can have: accumulators (mr * nr/VL vectors),
+    the B vectors (nr/VL) and one broadcast register must all fit."""
+    nr_vectors = -(-nr // t.vector_lanes)
+    return max(1, (t.vector_registers - nr_vectors - 1) // nr_vectors)
+
+
+def cache_tiles(m, n, k, mr, nr, t: Target):
+    """kc, mc, nc for a given register tile (see module docstring)."""
+    kc = largest_divisor(k, max(1, (t.l1_bytes // 2) // ((mr + nr) * 4)))
+    mc = largest_divisor(m, MAX_MC, multiple_of=mr)
+    nc = largest_divisor(n, min(MAX_NC, max(nr, (t.l2_bytes // 2) // (kc * 4))), multiple_of=nr)
+    return {"mc": mc, "nc": nc, "kc": kc}
+
+
 def matmul_tiles(m, n, k, t: Target):
     """BLIS-style tile sizes for C[m, n] += A[m, k] * B[k, n] (see module docstring)."""
     vl = t.vector_lanes
@@ -104,22 +119,24 @@ def matmul_tiles(m, n, k, t: Target):
         nr = vl
     else:
         nr = largest_divisor(n, 2 * vl)
-    nr_vectors = -(-nr // vl)
-    # accumulators (mr * nr_vectors) + B vectors (nr_vectors) + 1 broadcast must fit
-    mr_max = max(1, (t.vector_registers - nr_vectors - 1) // nr_vectors)
-    mr = largest_divisor(m, min(MAX_MR, mr_max))
-
-    kc = largest_divisor(k, max(1, (t.l1_bytes // 2) // ((mr + nr) * 4)))
-    mc = largest_divisor(m, MAX_MC, multiple_of=mr)
-    nc = largest_divisor(n, min(MAX_NC, max(nr, (t.l2_bytes // 2) // (kc * 4))), multiple_of=nr)
-    return {"mc": mc, "nc": nc, "kc": kc, "mr": mr, "nr": nr}
+    mr = largest_divisor(m, min(MAX_MR, max_mr(nr, t)))
+    return {**cache_tiles(m, n, k, mr, nr, t), "mr": mr, "nr": nr}
 
 
 class Schedule(Pass):
+    """Annotate kernels with schedules.
+
+    ``matmul_tiles_for(batch, m, n, k, target)`` chooses matmul tiles; it
+    defaults to the cost model above. The autotuner (kiln/passes/autotune.py)
+    plugs in here, replacing the model's guess with a measured choice.
+    """
+
     name = "schedule"
 
-    def __init__(self, target: Target | None = None):
+    def __init__(self, target: Target | None = None, matmul_tiles_for=None):
         self.target = target or host()
+        self.matmul_tiles_for = matmul_tiles_for or (
+            lambda batch, m, n, k, target: matmul_tiles(m, n, k, target))
 
     def run(self, graph: Graph):
         t = self.target
@@ -129,8 +146,11 @@ class Schedule(Pass):
             if k.kind == "matmul":
                 mm = next(n for n in k.nodes if n.op == "matmul")
                 a, b = mm.inputs[0].shape, mm.inputs[1].shape
-                k.attrs = {"strategy": "tiled", **matmul_tiles(a[-2], b[-1], a[-1], t),
-                           "vector": vector}
+                batch = 1
+                for d in a[:-2]:
+                    batch *= d
+                tiles = self.matmul_tiles_for(batch, a[-2], b[-1], a[-1], t)
+                k.attrs = {"strategy": "tiled", **tiles, "vector": vector}
             elif k.kind == "reduction":
                 reductions = [n for n in k.nodes if n.op.startswith("reduce_")]
                 if all(is_row_reduction(n) for n in reductions):

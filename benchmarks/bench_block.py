@@ -8,6 +8,9 @@ hide everything else, so "what does this optimisation cost me if I remove
 it" is the clearer measure of the others. The block is GPT-2 small (d_model
 768, 12 heads, MLP 3072) over 128 tokens, single-threaded.
 
+The first run autotunes the block's matmul shapes (~40 s, cached in
+~/.cache/kiln/autotune.json); later runs reuse the results.
+
     python benchmarks/bench_block.py
     python benchmarks/bench_block.py --tokens 64
 """
@@ -31,6 +34,7 @@ CONFIGS = [
     ("+ fusion", dict(freeze=True, fusion=True, memory_plan=False, tiling=False)),
     ("+ memory planning", dict(freeze=True, fusion=True, memory_plan=True, tiling=False)),
     ("+ tiling + vectorisation", dict(freeze=True, fusion=True, memory_plan=True, tiling=True)),
+    ("+ autotuning", dict(freeze=True, fusion=True, memory_plan=True, tiling=True, autotune=True)),
 ]
 
 
@@ -77,9 +81,9 @@ def main():
 
     print(f"\n{'all optimisations, minus':<27}{'kernels':>8}{'arena MiB':>11}{'compile s':>11}"
           f"{'latency ms':>12}{'slowdown':>10}")
-    print(f"{'(nothing)':<27}{'':>8}{'':>11}{'':>11}{full:>12.2f}{1:>9.2f}x")
+    print(f"{'(nothing; autotuned)':<27}{'':>8}{'':>11}{'':>11}{full:>12.2f}{1:>9.2f}x")
     for option in ("freeze", "fusion", "memory_plan"):
-        compiled = kiln.compile(model, (x,), **{option: False})
+        compiled = kiln.compile(model, (x,), autotune=True, **{option: False})
         torch.testing.assert_close(compiled(x), expected, rtol=1e-3, atol=1e-4)
         ms = ms_per_call(compiled, x)
         r = compiled.report

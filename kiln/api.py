@@ -20,6 +20,8 @@ class Options:
     memory_plan: bool = True     # buffers share arena memory when lifetimes don't overlap
     tiling: bool = True          # cache/register tiling + vectorisation (otherwise scalar loops)
     target: object = None        # kiln.target.Target to schedule for; default: the host CPU
+    autotune: bool = False       # choose matmul tiles by measurement (cached on disk)
+    matmul_tiles_for: object = None   # advanced: fn(batch, m, n, k, target) -> tiles
     print_ir: bool = False       # print the Kiln IR after every pass
     dump_mlir: bool = False      # print MLIR (and transform scripts) during lowering
     profile: bool = False        # emit per-kernel entry points for CompiledModule.profile()
@@ -40,6 +42,7 @@ class Report:
     naive_bytes: int = 0         # arena size without reuse (one slot per buffer)
     lower_bound_bytes: int = 0   # peak live bytes: no plan can be smaller
     compile_seconds: float = 0.0
+    autotune: list = field(default_factory=list)   # one entry per tuned / cached matmul shape
 
     def __str__(self):
         lines = [f"Kiln: {len(self.kernels)} kernels, compiled in {self.compile_seconds:.2f}s"]
@@ -53,10 +56,14 @@ class Report:
                      f"fallbacks: {len(low.get('fallback', []))}")
         for name, stats in self.passes.items():
             lines.append(f"  {name}: {stats}")
+        for e in self.autotune:
+            b, m, n, k = e["shape"]
+            lines.append(f"  autotune {b}x{m}x{n}x{k} ({e['source']}): {e['model_gflops']} -> "
+                         f"{e['gflops']} GFLOP/s, tiles {e['tiles']}")
         return "\n".join(lines)
 
 
-def build_passes(options: Options):
+def build_passes(options: Options, tuner=None):
     from kiln.passes.buffers import BufferAssignment
     from kiln.passes.memory_plan import MemoryPlan
     from kiln.passes.freeze import ConstantFold, FreezeParameters
@@ -71,7 +78,8 @@ def build_passes(options: Options):
     passes += [DCE(), Fusion() if options.fusion else OneOpPerKernel(),
                BufferAssignment(), MemoryPlan(reuse=options.memory_plan)]
     if options.tiling:
-        passes.append(Schedule(options.target))
+        tiles_for = options.matmul_tiles_for or (tuner.tiles_for if tuner is not None else None)
+        passes.append(Schedule(options.target, matmul_tiles_for=tiles_for))
     return passes
 
 
@@ -84,7 +92,12 @@ def compile_graph(graph: Graph, options: Options | None = None):
 
     options = options or Options()
     start = time.perf_counter()
-    pm = PassManager(build_passes(options), print_after_all=options.print_ir)
+    tuner = None
+    if options.autotune and options.tiling and options.matmul_tiles_for is None:
+        from kiln.passes.autotune import Autotuner
+
+        tuner = Autotuner(options.target)
+    pm = PassManager(build_passes(options, tuner), print_after_all=options.print_ir)
     pm.run(graph)
 
     def dump(title, text):
@@ -105,6 +118,7 @@ def compile_graph(graph: Graph, options: Options | None = None):
     plan = pm.stats.get("memory-plan", {})
     report.naive_bytes = plan.get("naive_bytes", 0)
     report.lower_bound_bytes = plan.get("lower_bound_bytes", 0)
+    report.autotune = tuner.log if tuner is not None else []
     report.compile_seconds = time.perf_counter() - start
     return exe, report
 
@@ -168,8 +182,8 @@ def compile(model, example_inputs, options: Options | None = None, **flags) -> C
         y = compiled(x)
         print(compiled.report)
 
-    Keyword flags (freeze, fusion, memory_plan, tiling, target, print_ir, dump_mlir,
-    profile) override fields of
+    Keyword flags (freeze, fusion, memory_plan, tiling, target, autotune, print_ir,
+    dump_mlir, profile) override fields of
     ``options``.
     """
     from kiln.frontend.fx_import import import_exported
