@@ -60,9 +60,18 @@ def load_module(source: str):
     digest = hashlib.sha256(source.encode()).hexdigest()[:16]
     path = kernel_dir() / f"kiln_{digest}.py"
     path.parent.mkdir(parents=True, exist_ok=True)
-    if not path.exists():
+    try:
+        intact = path.read_text() == source
+    except OSError:
+        intact = False
+    if not intact:
+        # A cached file can be empty or truncated if the machine lost power while writing it,
+        # so it's checked against the source and rewritten (and flushed to disk) if it differs.
         tmp = path.with_suffix(f".{os.getpid()}.tmp")
-        tmp.write_text(source)
+        with open(tmp, "w") as f:
+            f.write(source)
+            f.flush()
+            os.fsync(f.fileno())
         tmp.replace(path)
     spec = importlib.util.spec_from_file_location(f"kiln_triton_{digest}", path)
     module = importlib.util.module_from_spec(spec)
